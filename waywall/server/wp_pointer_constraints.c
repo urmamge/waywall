@@ -9,8 +9,12 @@
 #include "server/surface.h"
 #include "util/alloc.h"
 #include "util/prelude.h"
+#include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 /*
  * This module essentially implements a state machine where the pointer is either locked or
@@ -299,10 +303,40 @@ on_pointer(struct wl_listener *listener, void *data) {
     }
 }
 
+// Writes $XDG_RUNTIME_DIR/waywall-tabout for desktop tab-out tools (game-tabout-listener):
+// "focused" while waywall has focus, then "locked" or "free" at the moment it loses focus, i.e.
+// whether the game had the cursor grabbed. It's a snapshot because the game reacts to the focus
+// loss (pause menu) and unlocks right after, so the live state can't answer it.
+static void
+write_tabout_state(const char *state) {
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir) {
+        return;
+    }
+    char path[512], tmp[512];
+    snprintf(path, sizeof(path), "%s/waywall-tabout", dir);
+    snprintf(tmp, sizeof(tmp), "%s/waywall-tabout.%d", dir, (int)getpid());
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t len = (ssize_t)strlen(state);
+    bool ok = write(fd, state, len) == len;
+    close(fd);
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+    }
+}
+
 static void
 on_keyboard_leave(struct wl_listener *listener, void *data) {
     struct server_pointer_constraints *pointer_constraints =
         wl_container_of(listener, pointer_constraints, on_keyboard_leave);
+
+    // Runs in the same dispatch as the leave forwarded to the game, so the game can't have
+    // reacted yet: `locked` is still the state from before the tab-out.
+    write_tabout_state(pointer_constraints->locked ? "locked\n" : "free\n");
 
     // Tabbing out: release the remote lock (keeping our own `locked` state) so the host
     // compositor places the pointer at the hint, the centre of the window, like Minecraft
@@ -323,6 +357,8 @@ static void
 on_keyboard_enter(struct wl_listener *listener, void *data) {
     struct server_pointer_constraints *pointer_constraints =
         wl_container_of(listener, pointer_constraints, on_keyboard_enter);
+
+    write_tabout_state("focused\n");
 
     if (pointer_constraints->suspended) {
         pointer_constraints->suspended = false;
